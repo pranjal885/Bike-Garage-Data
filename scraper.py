@@ -31,31 +31,69 @@ class GoogleMapsScraper:
         self.page = None
 
     def start(self):
-        """Starts the browser context with stealth configurations."""
-        logger.info("Launching Chromium browser...")
-        self.playwright = sync_playwright().start()
-        
-        # Launch Chromium with anti-bot arguments
-        self.browser = self.playwright.chromium.launch(
-            headless=self.headless,
-            args=[
-                "--disable-blink-features=AutomationControlled",
-                "--no-sandbox",
-                "--disable-infobars",
-                "--window-size=1280,800",
-            ]
-        )
-        
-        self.context = self.browser.new_context(
-            viewport={"width": 1280, "height": 800},
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        )
-        
-        self.page = self.context.new_page()
-        Stealth().apply_stealth_sync(self.page)
-        
-        # Set default timeout
-        self.page.set_default_timeout(config.PAGE_TIMEOUT)
+      """Starts Chromium browser with stealth settings."""
+
+      logger.info("Launching Chromium browser...")
+
+      self.playwright = sync_playwright().start()
+
+      self.browser = self.playwright.chromium.launch(
+
+        headless=self.headless,
+
+        args=[
+
+            "--disable-blink-features=AutomationControlled",
+
+            "--disable-dev-shm-usage",
+
+            "--no-sandbox",
+
+            "--disable-infobars",
+
+            "--disable-gpu",
+
+            "--disable-extensions",
+
+            "--window-size=1280,800"
+
+        ]
+
+    )
+
+      self.context = self.browser.new_context(
+
+        viewport={
+
+            "width":1280,
+
+            "height":800
+
+        },
+
+        user_agent=(
+
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+
+            "Chrome/138.0.0.0 Safari/537.36"
+
+        ),
+
+        locale="en-IN",
+
+        timezone_id="Asia/Kolkata"
+
+    )
+
+      self.page = self.context.new_page()
+
+      Stealth().apply_stealth_sync(self.page)
+
+      self.page.set_default_timeout(config.PAGE_TIMEOUT)
+
+      logger.info("Browser launched successfully.")
 
     def close(self):
         """Safely closes the browser context."""
@@ -73,19 +111,55 @@ class GoogleMapsScraper:
         time.sleep(delay)
 
     def search_query(self, query):
-        """Navigates to Google Maps search page for a query."""
-        encoded_query = quote(query)
-        search_url = f"https://www.google.com/maps/search/{encoded_query}"
-        logger.info(f"Navigating to: {search_url}")
-        
+     """Search Google Maps with retry support."""
+
+     encoded_query = quote(query)
+     search_url = f"https://www.google.com/maps/search/{encoded_query}"
+
+     logger.info(f"Searching: {query}")
+
+     for attempt in range(3):
+
         try:
-            self.page.goto(search_url)
-            self.page.wait_for_load_state("domcontentloaded")
+
+            self.page.goto(
+                search_url,
+                wait_until="domcontentloaded"
+            )
+
+            # Wait for results feed if available
+            try:
+                self.page.wait_for_selector(
+                    'div[role="feed"]',
+                    timeout=10000
+                )
+            except:
+                pass
+
+            # Give Google Maps some time to render
+            time.sleep(2)
+
             self.random_delay()
+
+            # Detect CAPTCHA
+            if "sorry" in self.page.url.lower():
+                logger.warning("Google CAPTCHA detected.")
+                time.sleep(30)
+                continue
+
             return True
+
         except Exception as e:
-            logger.error(f"Error navigating to search page: {e}")
-            return False
+
+            logger.warning(
+                f"Search failed (Attempt {attempt + 1}/3): {e}"
+            )
+
+            time.sleep(random.randint(3, 7))
+
+     logger.error(f"Skipping query: {query}")
+
+     return False
 
     def is_single_result_page(self):
         """Checks if the search redirected directly to a single place page."""
@@ -167,75 +241,125 @@ class GoogleMapsScraper:
         return links
 
     def extract_details(self, url):
-        """Navigates to a listing URL and extracts Name, Phone, Address, and Website."""
-        logger.info(f"Extracting details from: {url.split('/place/')[1][:30]}...")
-        
+     """Extract Name, Phone, Address and Website with retries."""
+
+     logger.info(f"Extracting: {url}")
+ 
+     for attempt in range(3):
+
         try:
-            # Clear old detail elements from the DOM to prevent SPA race conditions
-            try:
-                self.page.evaluate("""() => {
-                    document.querySelector('h1')?.remove();
-                    document.querySelector('button[data-item-id="address"]')?.remove();
-                    document.querySelector('button[data-item-id^="phone:tel:"]')?.remove();
-                    document.querySelector('a[data-item-id="authority"]')?.remove();
-                }""")
-            except Exception:
-                pass
 
-            # Go directly to the place URL
-            self.page.goto(url)
-            self.page.wait_for_load_state("domcontentloaded")
+            self.page.goto(
+                url,
+                wait_until="domcontentloaded"
+            )
+
+            time.sleep(3)
             self.random_delay()
-            
-            # 1. Extract Name (typically the only H1 in the detail pane)
-            name = ""
-            try:
-                # Wait for the heading element to load
-                self.page.wait_for_selector('h1', timeout=10000)
-                name_element = self.page.locator('h1').first
-                name = clean_string(name_element.inner_text())
-            except Exception as e:
-                logger.warning(f"Could not extract business name: {e}")
-                return None  # If we can't get the name, this entry is invalid
-            
-            # 2. Extract Phone Number
-            phone = ""
-            try:
-                # Phone buttons have data-item-id starting with "phone:tel:"
-                phone_locator = self.page.locator('button[data-item-id^="phone:tel:"]')
-                if phone_locator.count() > 0:
-                    data_item_id = phone_locator.first.get_attribute("data-item-id")
-                    if data_item_id:
-                        phone = data_item_id.replace("phone:tel:", "").strip()
-                    else:
-                        phone = phone_locator.first.inner_text()
-                phone = clean_string(phone)
-            except Exception:
-                pass
-            
-            # 3. Extract Address
-            address = ""
-            try:
-                # Address button has data-item-id="address"
-                address_locator = self.page.locator('button[data-item-id="address"]')
-                if address_locator.count() > 0:
-                    address = clean_string(address_locator.first.inner_text())
-            except Exception:
-                pass
 
-            # 4. Extract Website
-            website = ""
+            # ---------------- Name ---------------- #
+
+            name = ""
+
             try:
-                # Website link has data-item-id="authority"
-                website_locator = self.page.locator('a[data-item-id="authority"]')
-                if website_locator.count() > 0:
-                    website = website_locator.first.get_attribute("href")
-                    if website:
-                        # Clean Google's redirect tracking parameters if any
-                        website = website.split("?")[0]
-                website = clean_string(website)
+                self.page.wait_for_selector("h1", timeout=10000)
+
+                name = clean_string(
+                    self.page.locator("h1").first.inner_text()
+                )
+
             except Exception:
-                pass
+                logger.warning("Name not found.")
+                return None
+
+            # ---------------- Phone ---------------- #
+
+            phone = ""
+
+            phone_selectors = [
+                'button[data-item-id^="phone:tel:"]',
+                'button[aria-label*="Phone"]',
+                'button[aria-label*="Call"]'
+            ]
+
+            for selector in phone_selectors:
+
+                try:
+
+                    locator = self.page.locator(selector)
+
+                    if locator.count() > 0:
+
+                        data = locator.first.get_attribute("data-item-id")
+
+                        if data and "phone:tel:" in data:
+                            phone = data.replace(
+                                "phone:tel:",
+                                ""
+                            ).strip()
+                        else:
+                            phone = locator.first.inner_text()
+
+                        phone = clean_string(phone)
+
+                        if phone:
+                            break
+
+                except Exception:
+                    pass
+
+            # ---------------- Address ---------------- #
+
+            address = ""
+
+            address_selectors = [
+                'button[data-item-id="address"]',
+                'button[aria-label*="Address"]'
+            ]
+
+            for selector in address_selectors:
+
+                try:
+
+                    locator = self.page.locator(selector)
+
+                    if locator.count() > 0:
+
+                        address = clean_string(
+                            locator.first.inner_text()
+                        )
+
+                        if address:
+                            break
+
+                except Exception:
+                    pass
+
+            # ---------------- Website ---------------- #
+
+            website = ""
+
+            website_selectors = [
+                'a[data-item-id="authority"]',
+                'a[aria-label*="Website"]'
+            ]
+
+            for selector in website_selectors:
+
+                try:
+
+                    locator = self.page.locator(selector)
+
+                    if locator.count() > 0:
+
+                        website = locator.first.get_attribute("href")
+
+                        if website:
+                            website = website.split("?")[0]
+                            break
+
+                except Exception:
+                    pass
 
             details = {
                 "name": name,
@@ -244,9 +368,21 @@ class GoogleMapsScraper:
                 "website": website,
                 "url": url
             }
-            logger.info(f"Successfully scraped: '{name}' | Phone: '{phone}' | Web: '{website}'")
+
+            logger.info(f"Scraped: {name}")
+
             return details
 
         except Exception as e:
-            logger.error(f"Error extracting details from listing: {e}")
-            return None
+
+            logger.warning(
+                f"Retry {attempt + 1}/3 : {e}"
+            )
+
+            time.sleep(random.randint(2, 5))
+
+     logger.error(
+        f"Failed after 3 retries : {url}"
+     )
+
+     return None
